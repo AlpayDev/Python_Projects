@@ -34,6 +34,16 @@ class Tile:
         self.block_sight = blocked if block_sight is None else block_sight
         self.explored = False
 
+# === Item ===
+class Item:
+    def __init__(self, x, y, name, char, color, effect=None):
+        self.x = x
+        self.y = y
+        self.name = name
+        self.char = char
+        self.color = color
+        self.effect = effect
+
 # === Rectangular Room ===
 class Rect:
     def __init__(self, x, y, w, h):
@@ -64,6 +74,7 @@ class Actor:
         self.speed = speed
         self.level = 1
         self.xp = 0
+        self.stat_points = 0
         self.inventory = []
 
     def move(self, dx, dy, game_map):
@@ -75,10 +86,32 @@ class Actor:
         self.hp -= amount
         return self.hp <= 0
 
+    def gain_xp(self, amount):
+        self.xp += amount
+        threshold = self.level * 50
+        if self.xp >= threshold:
+            self.xp -= threshold
+            self.level_up()
+
+    def level_up(self):
+        self.level += 1
+        self.stat_points += 5
+        print(f"{self.name} reached level {self.level}! Stat points +5")
+
     def attack_target(self, target):
-        # TODO: add hit chance roll
-        damage = max(0, self.attack - target.defense)
+        # Hit chance based on speed
+        hit_chance = self.speed / (self.speed + target.speed)
+        if random.random() < hit_chance:
+            base_damage = random.randint(1, self.attack)
+            damage = max(1, base_damage - target.defense)
+        else:
+            damage = 0
         died = target.take_damage(damage)
+        if died:
+            # XP reward if target has xp_yield
+            xp_yield = getattr(target, 'xp_yield', 0)
+            if xp_yield:
+                self.gain_xp(xp_yield)
         return damage, died
 
 # === Player Classes ===
@@ -93,6 +126,14 @@ class Rogue(Actor):
 class Mage(Actor):
     def __init__(self, x, y):
         super().__init__(x, y, '@', (0, 0, 255), 'Mage', hp=18, attack=9, defense=1, speed=2)
+
+# === Monster Class ===
+class Monster(Actor):
+    def __init__(self, x, y, template):
+        super().__init__(x, y, template['char'], template['color'], template['name'],
+                         hp=template['hp'], attack=template['attack'],
+                         defense=template['defense'], speed=template['speed'])
+        self.xp_yield = template.get('xp', 0)
 
 # === Monster Templates ===
 monster_templates = [
@@ -110,7 +151,9 @@ class GameMap:
         self.height = height
         self.tiles = self.initialize_tiles()
         self.rooms = []
+        self.items = []
         self.create_rooms_and_corridors()
+        self.place_items()
 
     def initialize_tiles(self):
         return [[Tile(True) for y in range(self.height)] for x in range(self.width)]
@@ -138,14 +181,9 @@ class GameMap:
             x = random.randint(0, self.width - w - 1)
             y = random.randint(0, self.height - h - 1)
             new_room = Rect(x, y, w, h)
-
             if any(new_room.intersect(other) for other in self.rooms):
                 continue
-
-            # Carve out this new room
             self.create_room(new_room)
-
-            # Connect to previous room with tunnels
             new_x, new_y = new_room.center()
             if self.rooms:
                 prev_x, prev_y = self.rooms[-1].center()
@@ -155,8 +193,17 @@ class GameMap:
                 else:
                     self.create_v_tunnel(prev_y, new_y, prev_x)
                     self.create_h_tunnel(prev_x, new_x, new_y)
-
             self.rooms.append(new_room)
+
+    def place_items(self):
+        # Place a couple of health potions per room
+        for room in self.rooms:
+            num_items = random.randint(0, 2)
+            for _ in range(num_items):
+                x = random.randint(room.x1 + 1, room.x2 - 1)
+                y = random.randint(room.y1 + 1, room.y2 - 1)
+                potion = Item(x, y, 'Health Potion', '!', (255, 0, 0), effect='heal')
+                self.items.append(potion)
 
     def is_blocked(self, x, y):
         if x < 0 or x >= self.width or y < 0 or y >= self.height:
@@ -174,6 +221,7 @@ class Game:
         self.actors = []
 
     def new_game(self, player_class):
+        # Place player in first room center
         center_x, center_y = self.game_map.rooms[0].center()
         if player_class.lower() == 'warrior':
             self.player = Warrior(center_x, center_y)
@@ -182,43 +230,93 @@ class Game:
         elif player_class.lower() == 'mage':
             self.player = Mage(center_x, center_y)
         self.actors = [self.player]
-        # TODO: spawn initial monsters
+        self.spawn_monsters()
+
+    def spawn_monsters(self):
+        for room in self.game_map.rooms[1:]:
+            num_monsters = random.randint(0, 3)
+            for _ in range(num_monsters):
+                x = random.randint(room.x1 + 1, room.x2 - 1)
+                y = random.randint(room.y1 + 1, room.y2 - 1)
+                template = random.choice(monster_templates)
+                monster = Monster(x, y, template)
+                self.actors.append(monster)
 
     def handle_keys(self):
+        moved = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return 'exit'
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_UP:
                     self.player.move(0, -1, self.game_map)
+                    moved = True
                 elif event.key == pygame.K_DOWN:
                     self.player.move(0, 1, self.game_map)
+                    moved = True
                 elif event.key == pygame.K_LEFT:
                     self.player.move(-1, 0, self.game_map)
+                    moved = True
                 elif event.key == pygame.K_RIGHT:
                     self.player.move(1, 0, self.game_map)
+                    moved = True
+        if moved:
+            self.check_for_combat()
+            self.check_for_items()
         return None
+
+    def check_for_combat(self):
+        # If player moves into a monster, resolve combat
+        for actor in self.actors[:]:
+            if actor is not self.player and actor.x == self.player.x and actor.y == self.player.y:
+                damage, died = self.player.attack_target(actor)
+                print(f"You hit {actor.name} for {damage} damage.")
+                if died:
+                    print(f"{actor.name} dies. You gain {actor.xp_yield} XP.")
+                    self.actors.remove(actor)
+                break
+
+    def check_for_items(self):
+        for item in self.game_map.items[:]:
+            if item.x == self.player.x and item.y == self.player.y:
+                self.player.inventory.append(item)
+                self.game_map.items.remove(item)
+                print(f"You picked up {item.name}.")
+                break
 
     def render(self):
         self.screen.fill((0, 0, 0))
-        for x in range(self.game_map.width):
-            for y in range(self.game_map.height):
+        # Camera viewport in tiles
+        vp_w = SCREEN_WIDTH // TILE_SIZE
+        vp_h = SCREEN_HEIGHT // TILE_SIZE
+        cam_x = self.player.x - vp_w // 2
+        cam_y = self.player.y - vp_h // 2
+        cam_x = max(0, min(cam_x, self.game_map.width - vp_w))
+        cam_y = max(0, min(cam_y, self.game_map.height - vp_h))
+
+        # Draw map tiles
+        for x in range(cam_x, cam_x + vp_w):
+            for y in range(cam_y, cam_y + vp_h):
                 tile = self.game_map.tiles[x][y]
-                if tile.blocked:
-                    color = COLOR_DARK_WALL
-                else:
-                    color = COLOR_DARK_FLOOR
-                pygame.draw.rect(
-                    self.screen,
-                    color,
-                    (x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
-                )
+                screen_x = (x - cam_x) * TILE_SIZE
+                screen_y = (y - cam_y) * TILE_SIZE
+                color = COLOR_DARK_WALL if tile.blocked else COLOR_DARK_FLOOR
+                pygame.draw.rect(self.screen, color, (screen_x, screen_y, TILE_SIZE, TILE_SIZE))
+
+        # Draw items
+        for item in self.game_map.items:
+            if cam_x <= item.x < cam_x + vp_w and cam_y <= item.y < cam_y + vp_h:
+                screen_x = (item.x - cam_x) * TILE_SIZE
+                screen_y = (item.y - cam_y) * TILE_SIZE
+                pygame.draw.rect(self.screen, item.color, (screen_x, screen_y, TILE_SIZE, TILE_SIZE))
+
+        # Draw actors
         for actor in self.actors:
-            pygame.draw.rect(
-                self.screen,
-                actor.color,
-                (actor.x * TILE_SIZE, actor.y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
-            )
+            if cam_x <= actor.x < cam_x + vp_w and cam_y <= actor.y < cam_y + vp_h:
+                screen_x = (actor.x - cam_x) * TILE_SIZE
+                screen_y = (actor.y - cam_y) * TILE_SIZE
+                pygame.draw.rect(self.screen, actor.color, (screen_x, screen_y, TILE_SIZE, TILE_SIZE))
+
         pygame.display.flip()
 
     def run(self):
